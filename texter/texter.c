@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <string.h>
+#include <fcntl.h>
 
 /* Simple text editor */
 
@@ -64,6 +65,7 @@ struct abuf {
 #define ABUF_INIT {NULL, 0}
 
 enum editorKey {
+	BACKSPACE = 127,
 	ARROW_LEFT = 1000,
 	ARROW_RIGHT,
 	ARROW_UP,
@@ -74,6 +76,10 @@ enum editorKey {
 	END_KEY,
 	DEL_KEY
 };
+
+/* prototypes */
+
+void editorSetStatusMessage(const char *fmt, ...);
 
 /*	utility functions	*/
 void die(const char *s) {
@@ -255,7 +261,7 @@ void editorRowInsertChar(erow *row, int at, int c) {
 	editorUpdateRow(row);
 }
 
-/***	editor operations	***/
+/*** editor ops ***/
 
 void editorInsertChar(int c) {
 	if (E.cy == E.numrows) {
@@ -266,6 +272,25 @@ void editorInsertChar(int c) {
 }
 
 /***	file i/o***/
+
+char *editorRowsToString(int *buflen) {
+	int totlen = 0;
+	int j;
+	for(j = 0; j < E.numrows; j++) {
+		totlen += E.row[j].size + 1;
+	}
+	*buflen = totlen;
+
+	char *buf = malloc(totlen);
+	char *p = buf;
+	for (j = 0; j < E.numrows; j++) {
+		memcpy(p, E.row[j].chars, E.row[j].size);
+		p += E.row[j].size;
+		*p = '\n';
+		p++;
+	}
+	return buf;
+}
 
 void editorOpen(char *filename) {
 	free(E.filename);
@@ -286,6 +311,28 @@ void editorOpen(char *filename) {
 	}
 	free(line);
 	fclose(fp);
+}
+
+void editorSave() {
+	if(E.filename == NULL) return;
+
+	int len;
+	char *buf = editorRowsToString(&len);
+
+	int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
+	if(fd != -1) {
+		if(ftruncate(fd, len) != -1) {
+			if(write(fd, buf, len) == len) {
+				close(fd);
+				free(buf);
+				editorSetStatusMessage("%d bytes written to disk", len);
+				return;
+			}
+		}
+		close(fd);
+	}
+	free(buf);
+	editorSetStatusMessage("Can't save! I/o error: %s", strerror(errno));
 }
 
 
@@ -326,10 +373,16 @@ erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
 void editorProcessKeypress() {
 	int c = editorReadKey();
 	switch (c) {
+	case '\r':
+
+		break;
 	case CTRL_KEY('q'):
 		write(STDOUT_FILENO, "\x1b[2J", 4);
 		write(STDOUT_FILENO, "\x1b[H", 3);
 		exit(0);
+		break;
+	case CTRL_KEY('s'):
+		editorSave();
 		break;
 
 	case HOME_KEY:
@@ -338,6 +391,13 @@ void editorProcessKeypress() {
 	case END_KEY:
 		if (E.cy < E.numrows) E.cx = E.row[E.cy].size;
 		break;
+
+	case BACKSPACE:
+	case CTRL_KEY('h'):
+	case DEL_KEY:
+
+		break;
+
 	case PAGE_UP:
 	case PAGE_DOWN:
 		{
@@ -359,6 +419,11 @@ void editorProcessKeypress() {
 	case ARROW_RIGHT:
 		editorMoveCursor(c);
 		break;
+
+	case CTRL_KEY('l'):
+	case '\x1b':
+		break;
+
 	default:
 		editorInsertChar(c);
 		break;
@@ -505,7 +570,7 @@ int main(int argc, char *argv[]) {
 		editorOpen(argv[1]);
 	}
 
-	editorSetStatusMessage("HELP: Ctrl-Q=quit, Ctrl-S=save, Ctrl-F=find");
+	editorSetStatusMessage("HELP: Ctrl-Q=quit | Ctrl-S=save | Ctrl-F=find");
 
   while(1) {
 		editorRefreshScreen();
