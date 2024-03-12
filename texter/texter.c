@@ -57,6 +57,7 @@ enum editorKey {
 enum editorHighlight {
 	HL_NORMAL = 0,
 	HL_COMMENT,
+	HL_MLCOMMENT,
 	HL_KEYWORD1,
 	HL_KEYWORD2,
 	HL_STRING,
@@ -75,15 +76,19 @@ struct editorSyntax {
 	char **filematch;
 	char **keywords;
 	char *singleline_comment_start;
+	char *multiline_comment_start;
+	char *multiline_comment_end;
 	int flags;
 };
 
 typedef struct erow {
+	int idx;
 	int size;
 	int rsize;
 	char *chars;
 	char *render;
 	unsigned char *hl;
+	int hl_open_comment;
 } erow;
 
 struct editorConfig {
@@ -124,7 +129,7 @@ struct editorSyntax HLDB[] = {
 		"c",
 		C_HL_extensions,
 		C_HL_keywords,
-		"//",
+		"//", "/*", "*/",
 		HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
 	},
 };
@@ -165,7 +170,7 @@ void disableRawMode() {
 
 /*  enableRawMode sets the terminal to raw mode.	*/
 void enableRawMode() {
-    if(tcgetattr(STDERR_FILENO, &E.orig_termios) == -1) die("tcgetattr");
+    if(tcgetattr(STDIN_FILENO, &E.orig_termios) == -1) die("tcgetattr");
 		atexit(disableRawMode);
     struct termios raw = E.orig_termios;
 	raw.c_iflag &= ~(ICRNL | IXON | ISTRIP | INPCK | BRKINT);
@@ -271,20 +276,47 @@ void editorUpdateSyntax(erow *row) {
 
 	char **keywords = E.syntax->keywords;
 	char *scs = E.syntax->singleline_comment_start;
+	char *mcs = E.syntax->multiline_comment_start;
+	char *mce = E.syntax->multiline_comment_end;
+
 	int scs_len = scs ? strlen(scs) : 0;
+	int mcs_len = mcs ? strlen(mcs) : 0;
+	int mce_len = mce ? strlen(mce) : 0;
 
   int prev_sep = 1;
 	int in_string = 0;
+	int in_comment = (row->idx > 0 && E.row[row->idx - 1].hl_open_comment);
 
 	int i = 0;
 	while (i < row->rsize) {
     char c = row->render[i];
     unsigned char prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
 
-		if (scs_len && !in_string) {
+		if (scs_len && !in_string && !in_comment) {
 			if (!strncmp(&row->render[i], scs, scs_len)) {
 				memset(&row->hl[i], HL_COMMENT, row->rsize - i);
 				break;
+			}
+		}
+
+		if (mcs_len && mce_len && !in_string) {
+			if (in_comment) {
+				row->hl[i] = HL_MLCOMMENT;
+				if (!strncmp(&row->render[i], mce, mce_len)) {
+					memset(&row->hl[i], HL_MLCOMMENT, mce_len);
+					i += mce_len;
+					in_comment = 0;
+					prev_sep = 1;
+					continue;
+				} else {
+					i++;
+					continue;
+				}
+			} else if (!strncmp(&row->render[i], mcs, mcs_len)) {
+				memset(&row->hl[i], HL_MLCOMMENT, mcs_len);
+				i += mcs_len;
+				in_comment = 1;
+				continue;
 			}
 		}
 		
@@ -343,6 +375,11 @@ void editorUpdateSyntax(erow *row) {
     prev_sep = is_separator(c);
     i++;
   }
+	int changed =(row->hl_open_comment != in_comment);
+	row->hl_open_comment = in_comment;
+	if (changed && row->idx + 1 < E.numrows) {
+		editorUpdateSyntax(&E.row[row->idx + 1]);
+	}
 }
 
 int editorSyntaxToColor(int hl) {
@@ -353,6 +390,7 @@ int editorSyntaxToColor(int hl) {
   	case HL_MATCH: return 34;
 		case HL_STRING: return 35;
 		case HL_COMMENT: return 36;
+		case HL_MLCOMMENT: return 36;
 		default: return 37;
 	}
 }
@@ -402,7 +440,7 @@ int editorRowRxToCx(erow *row,int rx) {
 	int cx;
 	for (cx = 0; cx < row->size; cx++) {
 		if (row->chars[cx] == '\t') 
-			cur_rx += (KILO_TABS_STOP - 1) - (cur_rx & KILO_TABS_STOP);
+			cur_rx += (KILO_TABS_STOP - 1) - (cur_rx % KILO_TABS_STOP);
 		cur_rx++;
 
 		if (cur_rx > rx) return cx;
@@ -440,6 +478,9 @@ void editorInsertRow(int at, char *s, size_t len) {
 
 	E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
 	memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
+	for (int j = at + 1; j <= E.numrows; j++) E.row[j].idx++;
+
+	E.row[at].idx = at;
 
 	E.row[at].size = len;
 	E.row[at].chars = malloc(len + 1);
@@ -449,9 +490,10 @@ void editorInsertRow(int at, char *s, size_t len) {
 	E.row[at].rsize = 0;
 	E.row[at].render = NULL;
 	E.row[at].hl = NULL;
+	E.row[at].hl_open_comment = 0;
 	editorUpdateRow(&E.row[at]);
 
-	E.numrows ++;
+	E.numrows++;
 	E.dirty++;
 }
 
@@ -465,6 +507,7 @@ void editorDelRow(int at) {
 	if (at < 0 || at >= E.numrows) return;
 	editorFreeRow(&E.row[at]);
 	memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
+	for (int j = at; j < E.numrows - 1; j++) E.row[j].idx--;
 	E.numrows--;
 	E.dirty++;
 }
@@ -572,8 +615,8 @@ void editorOpen(char *filename) {
 	ssize_t linelen;
 	
 	while ((linelen = getline(&line, &linecap, fp)) != -1) {
-		while (linelen >0 && (line[linelen-1] == '\n' || 
-													line[linelen-1] == '\r')) 
+		while (linelen > 0 && (line[linelen - 1] == '\n' || 
+													line[linelen - 1] == '\r')) 
 			linelen--;
 			
 		editorInsertRow(E.numrows, line, linelen);
@@ -610,7 +653,7 @@ void editorSave() {
 		close(fd);
 	}
 	free(buf);
-	editorSetStatusMessage("Can't save! I/o error: %s", strerror(errno));
+	editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
 }
 
 /*	find	*/
@@ -884,7 +927,17 @@ void editorDrawRows(struct abuf *ab) {
 			int current_color = -1;
 			int j;
 			for (j = 0; j < len; j++) {
-				if (hl[j] == HL_NORMAL) {
+				if (iscntrl(c[j])) {
+					char sym = (c[j] <= 26) ? '@' + c[j] : '?';
+					abAppend(ab, "\x1b[7m", 4);
+					abAppend(ab, &sym, 1);
+					abAppend(ab, "\x1b[m", 3);
+					if (current_color != -1) {
+						char buf[16];
+						int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
+						abAppend(ab, buf, clen);
+					}
+				}else if (hl[j] == HL_NORMAL) {
 					if (current_color != -1) {
 						abAppend(ab, "\x1b[39m", 5);
 						current_color = -1;	
@@ -904,7 +957,7 @@ void editorDrawRows(struct abuf *ab) {
 			abAppend(ab, "\x1b[39m", 5);
 		}
 
-		abAppend(ab, "\x1b[k", 3);
+		abAppend(ab, "\x1b[K", 3);
 		abAppend(ab, "\r\n", 2);
 		}
 }
